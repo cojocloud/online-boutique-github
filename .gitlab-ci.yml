@@ -1,0 +1,356 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Online Boutique – GitLab CI/CD Pipeline
+#
+# Authentication: GitLab OIDC → AWS STS (no long-lived credentials)
+# ─────────────────────────────────────────────────────────────────────────────
+# First-time bootstrap (one-off, done locally):
+#   cd terraform/environments/dev
+#   terraform init -backend-config="bucket=..." -backend-config="..."
+#   terraform apply            # creates the OIDC provider + IAM role
+#   terraform output gitlab_ci_role_arn   # copy this value
+#
+# GitLab CI/CD Variables (Settings → CI/CD → Variables):
+#   CI_AWS_ROLE_ARN     – ARN output by `terraform output gitlab_ci_role_arn`
+#                         (e.g. arn:aws:iam::123456789012:role/gitlab-ci-oidc-role)
+#   AWS_DEFAULT_REGION  – e.g. us-east-1
+#   TF_STATE_BUCKET     – S3 bucket for Terraform remote state
+#   TF_LOCK_TABLE       – DynamoDB table for state locking
+#   TF_VAR_cluster_name – (optional) override cluster name
+#   TF_VAR_environment  – (optional) dev | staging | prod  (default: dev)
+#
+# NO AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY are needed — credentials are
+# minted per-job via assume-role-with-web-identity and expire when the job ends.
+#
+# Pipeline stages:
+#   validate → lint & format checks
+#   plan     → terraform plan (every push)
+#   apply    → terraform apply (main branch, manual gate)
+#   deploy   → kubectl apply  (after apply)
+#   verify   → smoke-test the deployed app
+#   destroy  → terraform destroy (manual, any branch)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Pipeline trigger rules ────────────────────────────────────────────────────
+# Skip the entire pipeline when only documentation files change.
+# Always run on main (apply/deploy need it) and for MR events.
+# On feature branches, only run when Terraform, Kubernetes, or CI files change.
+
+workflow:
+  rules:
+    # Always run MR pipelines (plan shows up in the MR diff)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Always run on main — needed for the manual apply/deploy gate
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # On all other branches (e.g. dev), skip if only docs/non-infra files changed
+    - if: '$CI_COMMIT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - terraform/**/*
+        - kubernetes/**/*
+        - kustomize/**/*
+
+default:
+  image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+variables:
+  # Default values — override in GitLab Settings → CI/CD → Variables at runtime.
+  # GitLab CI does not support bash ${VAR:-default} syntax outside of shell scripts,
+  # so defaults must be declared here as top-level variables.
+  TF_VAR_environment: "dev"
+  TF_VAR_cluster_name: "online-boutique"
+
+  # Point at the environment-specific Terraform root for modular configs
+  TF_ROOT: "${CI_PROJECT_DIR}/terraform/environments/${TF_VAR_environment}"
+  K8S_MANIFEST: "${CI_PROJECT_DIR}/kubernetes/manifests.yaml"
+  KUSTOMIZE_DIR: "${CI_PROJECT_DIR}/kustomize"
+  TF_IN_AUTOMATION: "true"
+
+stages:
+  - validate
+  - plan
+  - apply
+  - deploy
+  - verify
+  - destroy
+
+# ── OIDC credential exchange ───────────────────────────────────────────────────
+# Each job that needs AWS access merges this anchor to receive a short-lived
+# GITLAB_OIDC_TOKEN, then exchanges it for temporary AWS credentials via STS.
+# Credentials are scoped to the job session and expire automatically.
+
+.oidc_token: &oidc_token
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: "https://gitlab.com"
+
+.assume_role: &assume_role |
+  if [ -z "${CI_AWS_ROLE_ARN}" ]; then
+    echo "ERROR: CI_AWS_ROLE_ARN is not set."
+    echo "Bootstrap OIDC locally first: cd terraform/environments/dev && terraform apply -target=module.gitlab_oidc"
+    echo "Then set CI_AWS_ROLE_ARN in GitLab Settings → CI/CD → Variables."
+    exit 1
+  fi
+  CREDS=$(aws sts assume-role-with-web-identity \
+    --role-arn "${CI_AWS_ROLE_ARN}" \
+    --role-session-name "gitlab-$(echo "${CI_JOB_NAME}" | tr ':' '-')-${CI_JOB_ID}" \
+    --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+    --duration-seconds 3600 \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+    --output text)
+  export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | awk '{print $1}')
+  export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | awk '{print $2}')
+  export AWS_SESSION_TOKEN=$(echo "$CREDS"     | awk '{print $3}')
+  aws sts get-caller-identity
+
+# ── Terraform job template ────────────────────────────────────────────────────
+
+.terraform_before: &terraform_before
+  <<: *oidc_token
+  before_script:
+    # The GitLab Terraform image is Alpine-based but ships without the AWS CLI.
+    # Install it so the OIDC assume-role script can call `aws sts`.
+    - apk add --no-cache aws-cli
+    - *assume_role
+    - cd "${TF_ROOT}"
+    - terraform --version
+    - terraform init
+        -reconfigure
+        -backend-config="bucket=${TF_STATE_BUCKET}"
+        -backend-config="region=${AWS_DEFAULT_REGION}"
+        -backend-config="dynamodb_table=${TF_LOCK_TABLE}"
+        -backend-config="encrypt=true"
+
+# ── Kubernetes deploy/verify job template ────────────────────────────────────
+
+.aws_tools: &aws_tools
+  <<: *oidc_token
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  before_script:
+    - *assume_role
+    - aws eks update-kubeconfig
+        --region "${AWS_DEFAULT_REGION}"
+        --name "${TF_VAR_cluster_name}"
+    # Install kubectl (not bundled in the AWS CLI image)
+    - |
+      curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      install -m 0755 kubectl /usr/local/bin/kubectl
+      kubectl version --client
+
+# ── Stage: validate ───────────────────────────────────────────────────────────
+
+terraform:fmt:
+  stage: validate
+  <<: *terraform_before
+  script:
+    - terraform fmt -check -recursive
+  allow_failure: false
+
+terraform:validate:
+  stage: validate
+  <<: *terraform_before
+  script:
+    - terraform validate
+  allow_failure: false
+
+yaml:lint:
+  stage: validate
+  image: python:3.12-slim
+  before_script:
+    - pip install --quiet yamllint
+  script:
+    - yamllint -d relaxed "${CI_PROJECT_DIR}/kubernetes/"
+    - yamllint -d relaxed "${CI_PROJECT_DIR}/kustomize/"
+  allow_failure: false
+
+# ── Stage: plan ───────────────────────────────────────────────────────────────
+
+terraform:plan:
+  stage: plan
+  <<: *terraform_before
+  script:
+    - terraform plan
+        -out="${TF_ROOT}/tfplan"
+        -var="aws_region=${AWS_DEFAULT_REGION}"
+  artifacts:
+    name: "tfplan-${CI_PIPELINE_ID}"
+    paths:
+      - "${TF_ROOT}/tfplan"
+      - "${TF_ROOT}/.terraform.lock.hcl"
+    expire_in: 7 days
+
+# ── Stage: apply ──────────────────────────────────────────────────────────────
+
+terraform:apply:
+  stage: apply
+  <<: *terraform_before
+  script:
+    - terraform apply -auto-approve "${TF_ROOT}/tfplan"
+    - |
+      echo "EKS_CLUSTER_NAME=$(terraform output -raw cluster_name)" >> "${TF_ROOT}/deploy.env"
+      echo "EKS_REGION=$(terraform output -raw cluster_region)"     >> "${TF_ROOT}/deploy.env"
+  artifacts:
+    reports:
+      dotenv: "${TF_ROOT}/deploy.env"
+    paths:
+      - "${TF_ROOT}/deploy.env"
+    expire_in: 1 day
+  dependencies:
+    - terraform:plan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  environment:
+    name: "${TF_VAR_environment}"
+    action: start
+
+# ── Stage: deploy ─────────────────────────────────────────────────────────────
+
+app:deploy:
+  stage: deploy
+  <<: *aws_tools
+  script:
+    - aws eks update-kubeconfig --region "${EKS_REGION}" --name "${EKS_CLUSTER_NAME}"
+    - kubectl create namespace online-boutique --dry-run=client -o yaml | kubectl apply -f -
+    # Install metrics-server (required by HPA; not bundled with EKS by default)
+    - kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    # Install kustomize (not bundled in the AWS CLI image; extract to /tmp to avoid
+    # collision with the repo's kustomize/ directory)
+    - |
+      yum install -y tar gzip -q
+      curl -sLO "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+      tar xzf kustomize_v5.4.3_linux_amd64.tar.gz -C /tmp/
+      install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+      kustomize version
+    # Wait for AWS Load Balancer Controller to register the 'alb' IngressClass
+    # (LBC is installed by terraform:apply via Helm; it needs ~30–60 s to start)
+    - |
+      for i in $(seq 1 12); do
+        kubectl get ingressclass alb >/dev/null 2>&1 && break
+        echo "Waiting for alb IngressClass... (${i}/12)"
+        sleep 15
+      done
+      kubectl get ingressclass alb >/dev/null 2>&1 \
+        || echo "WARNING: alb IngressClass not yet registered — LBC pods may still be starting"
+    - kustomize build --load-restrictor=LoadRestrictionsNone "${KUSTOMIZE_DIR}" | kubectl apply -n online-boutique -f -
+    - kubectl rollout status deployment --timeout=300s -n online-boutique
+  dependencies:
+    - terraform:apply
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+  environment:
+    name: "${TF_VAR_environment}"
+    action: start
+
+dns:apply:
+  stage: deploy
+  <<: *terraform_before
+  script:
+    # Install kubectl into the Alpine-based Terraform image
+    - apk add --no-cache curl
+    - curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - install -m 0755 kubectl /usr/local/bin/kubectl
+    - aws eks update-kubeconfig --region "${AWS_DEFAULT_REGION}" --name "${TF_VAR_cluster_name}"
+    # Ensure ACM certificate exists and is validated via Route53 DNS
+    - terraform apply
+        -auto-approve
+        -target=module.acm[0]
+        -var="aws_region=${AWS_DEFAULT_REGION}"
+    # Annotate the Ingress with the ACM cert, enable HTTPS listener, and
+    # add the ssl-redirect annotation to redirect HTTP → HTTPS at the ALB
+    - CERT_ARN=$(terraform output -raw acm_certificate_arn)
+    - |
+      kubectl annotate ingress frontend -n online-boutique \
+        "alb.ingress.kubernetes.io/certificate-arn=${CERT_ARN}" \
+        "alb.ingress.kubernetes.io/ssl-redirect=443" \
+        "alb.ingress.kubernetes.io/listen-ports=[{\"HTTP\": 80}, {\"HTTPS\": 443}]" \
+        --overwrite
+    # Wait for the ALB to be provisioned and get a hostname
+    - |
+      for i in $(seq 1 30); do
+        ALB_HOST=$(kubectl get ingress frontend -n online-boutique \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        [ -n "${ALB_HOST}" ] && break
+        echo "Waiting for ALB hostname... (${i}/30)"
+        sleep 15
+      done
+      if [ -z "${ALB_HOST}" ]; then
+        echo "ERROR: ALB hostname not available after timeout"
+        exit 1
+      fi
+      echo "ALB hostname: ${ALB_HOST}"
+    # Create/update Route53 CNAME record pointing subdomain to the ALB
+    - terraform apply
+        -auto-approve
+        -target=module.route53[0]
+        -var="aws_region=${AWS_DEFAULT_REGION}"
+    - echo "Frontend URL $(terraform output -raw frontend_url)"
+  needs:
+    - app:deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+  environment:
+    name: "${TF_VAR_environment}"
+    action: start
+
+# ── Stage: verify ─────────────────────────────────────────────────────────────
+
+app:smoke-test:
+  stage: verify
+  <<: *aws_tools
+  script:
+    # Wait for the ALB hostname to be assigned to the Ingress
+    - |
+      for i in $(seq 1 20); do
+        ALB_HOST=$(kubectl get ingress frontend -n online-boutique \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        [ -n "${ALB_HOST}" ] && break
+        echo "Waiting for ALB hostname... (${i}/20)"
+        sleep 15
+      done
+      if [ -z "${ALB_HOST}" ]; then
+        echo "ERROR: ALB hostname not available after timeout"
+        exit 1
+      fi
+      echo "ALB host: ${ALB_HOST}"
+    # Verify HTTP health check via raw ALB hostname (avoids DNS propagation delay)
+    - |
+      for i in $(seq 1 10); do
+        # Follow redirects (-L) and skip cert check (-k) since the cert is issued
+        # for the custom domain, not the raw ALB hostname
+        STATUS=$(curl -skL -o /dev/null -w "%{http_code}" "http://${ALB_HOST}/_healthz" || true)
+        if [ "${STATUS}" = "200" ]; then
+          echo "Health check passed (HTTP ${STATUS})"
+          echo "App is live at https://online-boutique.cojocloudsolutions.com"
+          exit 0
+        fi
+        echo "Health check returned ${STATUS}, retrying (${i}/10)..."
+        sleep 30
+      done
+      echo "ERROR: Health check failed after retries"
+      exit 1
+  needs:
+    - dns:apply
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+
+# ── Stage: destroy (manual) ───────────────────────────────────────────────────
+
+terraform:destroy:
+  stage: destroy
+  <<: *terraform_before
+  script:
+    - terraform destroy
+        -auto-approve
+        -var="aws_region=${AWS_DEFAULT_REGION}"
+  rules:
+    - when: manual
+  allow_failure: true
+  environment:
+    name: "${TF_VAR_environment}"
+    action: stop
+

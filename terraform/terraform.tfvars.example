@@ -1,0 +1,35 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to version control (add it to .gitignore).
+#
+# Prefer the environment-specific configs for team workflows:
+#   terraform/environments/dev/terraform.tfvars
+#   terraform/environments/prod/terraform.tfvars
+
+aws_region         = "us-east-1"
+cluster_name       = "online-boutique"
+environment        = "dev"
+kubernetes_version = "1.30"
+namespace          = "online-boutique"
+
+# VPC
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = []   # leave empty to auto-select 3 AZs
+
+# Node group
+node_instance_types = ["t3.medium"]
+node_desired_size   = 3
+node_min_size       = 2
+node_max_size       = 6
+node_disk_size      = 50
+
+# Set to true to replace in-cluster Redis with AWS ElastiCache
+enable_elasticache    = false
+elasticache_node_type = "cache.t3.micro"
+
+# ── GitLab OIDC (replaces long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+# After `terraform apply`, copy the `gitlab_ci_role_arn` output and set it as
+# CI_AWS_ROLE_ARN in GitLab → Settings → CI/CD → Variables.
+
+gitlab_project_path = "your-gitlab-group/online-boutique"
+tf_state_bucket     = "your-terraform-state-bucket"
+tf_lock_table       = "your-terraform-lock-table"

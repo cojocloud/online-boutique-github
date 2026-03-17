@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../kubernetes/manifests.yaml
+  - ../kubernetes/ingress.yaml
+  - ../kubernetes/hpa.yaml
+  - ../kubernetes/pdb.yaml
+  - ../kubernetes/network-policies.yaml
+
+# ── Optional overlays ─────────────────────────────────────────────────────────
+# Uncomment to enable deployment variations.
+# Each component patches or extends the base manifest.
+
+components:
+  # Remove the synthetic load generator (recommended for staging/prod)
+  # - components/without-loadgenerator
+
+  # Replace in-cluster Redis with AWS ElastiCache
+  # (requires enable_elasticache = true in Terraform)
+  # - components/elasticache-redis
+
+  # Restrict frontend to an internal (non-public) load balancer
+  # - components/non-public-frontend
