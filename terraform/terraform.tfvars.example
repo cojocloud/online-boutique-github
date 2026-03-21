@@ -1,9 +1,8 @@
-# Copy this file to terraform.tfvars and fill in your values.
-# NEVER commit terraform.tfvars to version control (add it to .gitignore).
-#
-# Prefer the environment-specific configs for team workflows:
-#   terraform/environments/dev/terraform.tfvars
-#   terraform/environments/prod/terraform.tfvars
+# Root-level tfvars — used only when running terraform from terraform/ directly.
+# For the environment-specific configs (recommended), use:
+#   terraform/environments/dev/terraform.tfvars.example
+#   terraform/environments/prod/terraform.tfvars.example
+# NOTE: `environment` is a root-level-only variable; do NOT include it in env-specific tfvars.
 
 aws_region         = "us-east-1"
 cluster_name       = "online-boutique"
@@ -26,10 +25,10 @@ node_disk_size      = 50
 enable_elasticache    = false
 elasticache_node_type = "cache.t3.micro"
 
-# ── GitLab OIDC (replaces long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
-# After `terraform apply`, copy the `gitlab_ci_role_arn` output and set it as
-# CI_AWS_ROLE_ARN in GitLab → Settings → CI/CD → Variables.
+# ── GitHub OIDC (replaces long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+# After `terraform apply`, copy the `github_ci_role_arn` output and set it as
+# GH_AWS_ROLE_ARN in GitHub → Settings → Secrets and variables → Actions → Variables.
 
-gitlab_project_path = "your-gitlab-group/online-boutique"
-tf_state_bucket     = "your-terraform-state-bucket"
-tf_lock_table       = "your-terraform-lock-table"
+github_repository = "your-github-org/online-boutique"
+tf_state_bucket   = "tf-state-online-boutique-github"
+tf_lock_table     = "tf-state-lock-github"

@@ -21,7 +21,7 @@ terraform {
   }
 
   # S3 backend with partial configuration — bucket, region, and dynamodb_table
-  # are supplied at terraform init via -backend-config flags (see .gitlab-ci.yml).
+  # are supplied at terraform init via -backend-config flags (see .github/workflows/deploy.yml).
   backend "s3" {
     key     = "online-boutique/terraform.tfstate"
     encrypt = true

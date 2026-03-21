@@ -49,13 +49,13 @@ module "elasticache" {
   high_availability = var.elasticache_high_availability
 }
 
-# Prod: only the main branch can assume the GitLab CI role
-module "gitlab_oidc" {
-  source = "../../modules/gitlab-oidc"
+# Prod: only the main branch can assume the GitHub CI role
+module "github_oidc" {
+  source = "../../modules/github-oidc"
 
-  role_name           = "gitlab-ci-oidc-role-prod"
-  gitlab_project_path = var.gitlab_project_path
-  allowed_branches    = "main"
+  role_name           = "github-ci-oidc-role-prod"
+  github_repository   = var.github_repository
+  allowed_ref_pattern = "ref:refs/heads/main"
   tf_state_bucket     = var.tf_state_bucket
   tf_lock_table       = var.tf_lock_table
 }

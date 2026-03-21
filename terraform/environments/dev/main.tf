@@ -44,6 +44,19 @@ module "elasticache" {
 # Required for ALB-backed Ingress resources with HTTP→HTTPS redirect.
 # The controller is installed during terraform:apply so it is ready before
 # app:deploy creates the Ingress resource.
+# Bootstrap GitHub OIDC trust. After the first apply, copy the role_arn output
+# and set it as GH_AWS_ROLE_ARN in GitHub → Settings → Secrets and variables → Actions → Variables.
+# Dev: allow all branches so feature-branch pipelines can run plan.
+module "github_oidc" {
+  source = "../../modules/github-oidc"
+
+  role_name           = "github-ci-oidc-role-dev"
+  github_repository   = var.github_repository
+  allowed_ref_pattern = "*"
+  tf_state_bucket     = var.tf_state_bucket
+  tf_lock_table       = var.tf_lock_table
+}
+
 module "alb_controller" {
   source = "../../modules/alb-controller"
 

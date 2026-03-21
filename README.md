@@ -1,6 +1,6 @@
-# Online Boutique – AWS EKS + GitLab CI/CD
+# Online Boutique – AWS EKS + GitHub Actions
 
-A cloud-native microservices e-commerce application, refactored from Google's GKE/GCP demo to run on **AWS EKS** with a **GitLab CI/CD** pipeline for automated infrastructure provisioning and application deployment.
+A cloud-native microservices e-commerce application, refactored from Google's GKE/GCP demo to run on **AWS EKS** with a **GitHub Actions** pipeline for automated infrastructure provisioning and application deployment.
 
 > **Upstream source:** [GoogleCloudPlatform/microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo)
 
@@ -14,7 +14,7 @@ A cloud-native microservices e-commerce application, refactored from Google's GK
 4. [Prerequisites](#prerequisites)
 5. [Part 1 – AWS bootstrap](#part-1--aws-bootstrap)
 6. [Part 2 – Local deployment](#part-2--local-deployment)
-7. [Part 3 – GitLab CI/CD pipeline](#part-3--gitlab-cicd-pipeline)
+7. [Part 3 – GitHub Actions pipeline](#part-3--github-actions-pipeline)
 8. [Deployment variations](#deployment-variations)
 9. [Useful commands](#useful-commands)
 10. [Teardown](#teardown)
@@ -25,21 +25,21 @@ A cloud-native microservices e-commerce application, refactored from Google's GK
 ## Architecture overview
 
 ```
-GitLab CI/CD Pipeline
+GitHub Actions Pipeline
         │
         ├─ validate  →  terraform fmt / validate, yamllint
         ├─ plan      →  terraform plan (every push)
         ├─ apply     →  terraform apply (main branch, manual gate)
         ├─ deploy    →  kubectl apply via kustomize
         ├─ verify    →  smoke-test ELB endpoint
-        └─ destroy   →  terraform destroy (manual)
+        └─ destroy   →  terraform destroy (manual workflow_dispatch)
 
 AWS Infrastructure (Terraform – modular)
         │
         ├─ modules/vpc          → VPC, subnets, NAT gateways
         ├─ modules/eks          → EKS cluster, node group, IRSA, Pod Security Standards
         ├─ modules/elasticache  → Managed Redis (HA in prod, single node in dev)
-        └─ modules/gitlab-oidc  → OIDC provider + scoped IAM role (no long-lived keys)
+        └─ modules/github-oidc  → OIDC provider + scoped IAM role (no long-lived keys)
 
 Kubernetes (11 microservices + production add-ons)
         frontend ── checkoutservice ── paymentservice
@@ -59,36 +59,37 @@ Kubernetes (11 microservices + production add-ons)
 
 This section explains the specific choices made to bring the project to a production-grade standard.
 
-### 1. No long-lived AWS credentials — GitLab OIDC federation
+### 1. No long-lived AWS credentials — GitHub Actions OIDC federation
 
-**Problem:** Storing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` as GitLab CI variables creates static, long-lived secrets that never expire. If a GitLab variable is leaked (via logs, a compromised runner, or an accidental echo), the key remains valid indefinitely.
+**Problem:** Storing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` as GitHub Actions secrets creates static, long-lived secrets that never expire. If a secret is leaked (via logs, a compromised runner, or an accidental echo), the key remains valid indefinitely.
 
-**Solution:** GitLab OIDC federation via `aws sts assume-role-with-web-identity`.
+**Solution:** GitHub Actions OIDC federation via `aws-actions/configure-aws-credentials`.
 
 How it works:
-1. GitLab's identity service issues a signed JSON Web Token (JWT) to each CI job when `id_tokens` is defined in the job configuration.
-2. The job calls `aws sts assume-role-with-web-identity`, passing that JWT.
-3. AWS validates the JWT's signature against the registered OIDC provider (`gitlab.com`) and checks the `sub` claim — which encodes the project path and branch — against the IAM role's trust policy.
+1. Each job declares `permissions: id-token: write`, which allows GitHub's identity service to issue a signed JSON Web Token (JWT) to the job.
+2. The `aws-actions/configure-aws-credentials` action presents that JWT to AWS STS via `assume-role-with-web-identity`.
+3. AWS validates the JWT's signature against the registered OIDC provider (`token.actions.githubusercontent.com`) and checks the `sub` claim — which encodes the repository and branch — against the IAM role's trust policy.
 4. AWS returns temporary credentials (Access Key ID, Secret Access Key, Session Token) that **expire automatically** when the job ends (max 1 hour).
 
-The only CI variable needed is `CI_AWS_ROLE_ARN` — the ARN of the IAM role. It is not a secret.
+The only variable needed is `GH_AWS_ROLE_ARN` — the ARN of the IAM role. It is not a secret.
 
-The IAM role is created and managed by the **`terraform/modules/gitlab-oidc/`** module. Its trust policy is scoped to a single GitLab project path and branch pattern (e.g., `main`-only for prod), so a token from any other project or branch is rejected by AWS.
+The IAM role is bootstrapped via the **`terraform/modules/github-oidc/`** module (see [Part 1.2](#12-bootstrap-the-github-oidc-trust-one-off-local-apply)). Its trust policy is scoped to a single GitHub repository and branch pattern (e.g., `main`-only for prod), so a token from any other repository or branch is rejected by AWS.
 
 ```
                           ┌─────────────────────────────────┐
-GitLab Job                │  AWS STS                        │
-  id_tokens:              │                                 │
-    GITLAB_OIDC_TOKEN ──► │  assume-role-with-web-identity  │
+GitHub Actions Job        │  AWS STS                        │
+  permissions:            │                                 │
+    id-token: write ────► │  assume-role-with-web-identity  │
                           │  validates JWT against OIDC     │
-                          │  provider (gitlab.com)          │
+                          │  provider (token.actions.       │
+                          │  githubusercontent.com)          │
                           │                                 │
                           │  ◄── temp credentials (1hr)     │
                           └─────────────────────────────────┘
 ```
 
-**What you remove from GitLab CI/CD Variables:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-**What you add:** `CI_AWS_ROLE_ARN` (the IAM role ARN — not a secret).
+**What you remove from GitHub secrets:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+**What you add:** `GH_AWS_ROLE_ARN` (the IAM role ARN — not a secret, stored as a variable).
 
 ---
 
@@ -103,7 +104,7 @@ GitLab Job                │  AWS STS                        │
 | `modules/vpc` | VPC, public/private subnets, NAT gateways, route tables, EKS subnet tags |
 | `modules/eks` | EKS cluster, managed node group, IRSA, EBS CSI add-on, application namespace |
 | `modules/elasticache` | ElastiCache Redis replication group, subnet group, security group |
-| `modules/gitlab-oidc` | IAM OIDC provider, CI role, least-privilege deploy policy |
+| `modules/github-oidc` | IAM OIDC provider, CI role, least-privilege deploy policy |
 
 Each module has a clean `variables.tf` / `main.tf` / `outputs.tf` contract. Modules are called by environment-specific root configurations in `terraform/environments/`:
 
@@ -113,7 +114,7 @@ terraform/
 │   ├── vpc/
 │   ├── eks/
 │   ├── elasticache/
-│   └── gitlab-oidc/
+│   └── github-oidc/
 └── environments/
     ├── dev/    ← public API endpoint, t3.medium, 1 NAT gateway
     └── prod/   ← downsized POC defaults with production values commented inline
@@ -192,57 +193,60 @@ For example, `paymentservice` accepts connections only from `checkoutservice` on
 
 ```
 .
-├── .gitlab-ci.yml                       # CI/CD pipeline (OIDC-based AWS auth)
+├── .github/
+│   └── workflows/
+│       ├── deploy.yml                       # CI/CD pipeline (OIDC-based AWS auth)
+│       └── destroy.yml                      # Manual teardown (workflow_dispatch)
 │
 ├── terraform/
 │   ├── modules/
-│   │   ├── vpc/                         # VPC, subnets, NAT gateways
+│   │   ├── vpc/                             # VPC, subnets, NAT gateways
 │   │   │   ├── main.tf
 │   │   │   ├── variables.tf
 │   │   │   └── outputs.tf
-│   │   ├── eks/                         # EKS cluster, node group, IRSA
+│   │   ├── eks/                             # EKS cluster, node group, IRSA
 │   │   │   ├── main.tf
 │   │   │   ├── variables.tf
 │   │   │   └── outputs.tf
-│   │   ├── elasticache/                 # Managed Redis (optional)
+│   │   ├── elasticache/                     # Managed Redis (optional)
 │   │   │   ├── main.tf
 │   │   │   ├── variables.tf
 │   │   │   └── outputs.tf
-│   │   └── gitlab-oidc/                 # OIDC provider + CI IAM role
+│   │   └── github-oidc/                     # OIDC provider + CI IAM role
 │   │       ├── main.tf
 │   │       ├── variables.tf
 │   │       └── outputs.tf
 │   │
 │   ├── environments/
-│   │   ├── dev/                         # Dev environment root config
+│   │   ├── dev/                             # Dev environment root config
 │   │   │   ├── main.tf
 │   │   │   ├── providers.tf
 │   │   │   ├── variables.tf
 │   │   │   ├── outputs.tf
 │   │   │   └── terraform.tfvars
-│   │   └── prod/                        # Prod environment root config
+│   │   └── prod/                            # Prod environment root config
 │   │       ├── main.tf
 │   │       ├── providers.tf
 │   │       ├── variables.tf
 │   │       ├── outputs.tf
 │   │       └── terraform.tfvars
 │   │
-│   ├── main.tf                          # Single-env root (calls modules)
-│   ├── providers.tf                     # AWS, Kubernetes, Helm providers
-│   ├── variables.tf                     # All input variables
-│   ├── outputs.tf                       # Cluster outputs
-│   └── terraform.tfvars.example         # Template – copy and fill in
+│   ├── main.tf                              # Single-env root (calls modules)
+│   ├── providers.tf                         # AWS, Kubernetes, Helm providers
+│   ├── variables.tf                         # All input variables
+│   ├── outputs.tf                           # Cluster outputs
+│   └── terraform.tfvars.example             # Template – copy and fill in
 │
 ├── kubernetes/
-│   ├── manifests.yaml                   # 11 microservice Deployments + Services
-│   ├── hpa.yaml                         # Horizontal Pod Autoscalers
-│   ├── pdb.yaml                         # PodDisruptionBudgets
-│   └── network-policies.yaml            # Zero-trust NetworkPolicies
+│   ├── manifests.yaml                       # 11 microservice Deployments + Services
+│   ├── hpa.yaml                             # Horizontal Pod Autoscalers
+│   ├── pdb.yaml                             # PodDisruptionBudgets
+│   └── network-policies.yaml               # Zero-trust NetworkPolicies
 │
 └── kustomize/
-    ├── kustomization.yaml               # Base resources + optional overlays
+    ├── kustomization.yaml                   # Base resources + optional overlays
     └── components/
-        └── without-loadgenerator/       # Removes loadgenerator (staging/prod)
+        └── without-loadgenerator/           # Removes loadgenerator (staging/prod)
 ```
 
 ---
@@ -268,75 +272,88 @@ These steps are performed **once** by a human with admin-level AWS access. After
 ```bash
 # S3 bucket for remote state
 aws s3api create-bucket \
-  --bucket my-tf-state-online-boutique \
+  --bucket tf-state-online-boutique-github \
   --region us-east-1
 
 aws s3api put-bucket-versioning \
-  --bucket my-tf-state-online-boutique \
+  --bucket tf-state-online-boutique-github \
   --versioning-configuration Status=Enabled
 
 aws s3api put-bucket-encryption \
-  --bucket my-tf-state-online-boutique \
+  --bucket tf-state-online-boutique-github \
   --server-side-encryption-configuration \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
 # DynamoDB table for state locking
 aws dynamodb create-table \
-  --table-name tf-state-lock \
+  --table-name tf-state-lock-github \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
   --region us-east-1
 ```
 
-### 1.2 Bootstrap the GitLab OIDC trust (one-off local apply)
+### 1.2 Bootstrap the GitHub OIDC trust (one-off local apply)
 
 This creates the IAM OIDC provider and the CI role that all future pipeline runs will use. You need temporary admin-level credentials for this step only.
 
+The `terraform/modules/github-oidc/` module provisions the AWS OIDC provider and IAM role, configured specifically for GitHub Actions (`token.actions.githubusercontent.com`).
+
 ```bash
-# Configure your local AWS credentials (these are only used for this bootstrap)
+# Configure your local AWS credentials (only needed for this bootstrap)
 aws configure
 
-# Edit terraform/environments/dev/terraform.tfvars and fill in:
-#   gitlab_project_path = "your-gitlab-group/online-boutique"
-#   tf_state_bucket     = "my-tf-state-online-boutique"
-#   tf_lock_table       = "tf-state-lock"
+# Create your tfvars from the example (already in .gitignore — do not commit it):
+cp terraform/environments/dev/terraform.tfvars.example terraform/environments/dev/terraform.tfvars
+# Then edit terraform/environments/dev/terraform.tfvars and set:
+#   github_repository = "your-github-org/online-boutique"
+#   tf_state_bucket   = "tf-state-online-boutique-github"
+#   tf_lock_table     = "tf-state-lock-github"
 
 cd terraform/environments/dev
 
 terraform init \
-  -backend-config="bucket=my-tf-state-online-boutique" \
+  -backend-config="bucket=tf-state-online-boutique-github" \
   -backend-config="region=us-east-1" \
-  -backend-config="dynamodb_table=tf-state-lock"
+  -backend-config="dynamodb_table=tf-state-lock-github"
 
 # Bootstrap ONLY the OIDC module first — this is all the pipeline needs to self-authenticate.
 # The pipeline provisions the rest of the infrastructure on its own after this step.
-terraform apply -target=module.gitlab_oidc
+terraform apply -target=module.github_oidc
 ```
 
 After apply completes, copy the role ARN from the output:
 
 ```
 Outputs:
-  gitlab_ci_role_arn = "arn:aws:iam::123456789012:role/gitlab-ci-oidc-role"
+  github_ci_role_arn = "arn:aws:iam::123456789012:role/github-ci-oidc-role-dev"
 ```
 
-You will set this as `CI_AWS_ROLE_ARN` in the next step. **This is the last time you will need local AWS credentials for this project.**
+You will set this as `GH_AWS_ROLE_ARN` in the next step. **This is the last time you will need local AWS credentials for this project.**
 
-### 1.3 Set GitLab CI/CD variables
+### 1.3 Set GitHub Actions variables
 
-Go to your GitLab project → **Settings → CI/CD → Variables** and add:
+Go to your GitHub repository → **Settings → Secrets and variables → Actions → Variables** and add:
 
 | Variable | Value | Sensitive? |
 |---|---|---|
-| `CI_AWS_ROLE_ARN` | ARN from step 1.2 (e.g. `arn:aws:iam::123456789012:role/gitlab-ci-oidc-role`) | No — it's just an ARN |
+| `GH_AWS_ROLE_ARN` | ARN from step 1.2 (e.g. `arn:aws:iam::123456789012:role/github-ci-oidc-role`) | No — it's just an ARN |
 | `AWS_DEFAULT_REGION` | `us-east-1` | No |
-| `TF_STATE_BUCKET` | `my-tf-state-online-boutique` | No |
-| `TF_LOCK_TABLE` | `tf-state-lock` | No |
+| `TF_STATE_BUCKET` | `tf-state-online-boutique-github` | No |
+| `TF_LOCK_TABLE` | `tf-state-lock-github` | No |
 | `TF_VAR_cluster_name` | `online-boutique` | No |
 | `TF_VAR_environment` | `dev` | No |
 
-> **Notice:** There is no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. GitLab CI exchanges a short-lived OIDC token for temporary credentials on every job run. See [Production design decisions → No long-lived credentials](#1-no-long-lived-aws-credentials--gitlab-oidc-federation).
+> **Notice:** There is no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. GitHub Actions exchanges a short-lived OIDC token for temporary credentials on every job run via `aws-actions/configure-aws-credentials`. See [Production design decisions → No long-lived credentials](#1-no-long-lived-aws-credentials--github-actions-oidc-federation).
+
+### 1.4 Configure the manual approval gate
+
+The `terraform-apply` job references a GitHub **environment** (named after `TF_VAR_environment`, e.g. `dev`). To require a manual approval before apply runs:
+
+1. Go to **Settings → Environments → dev** (create it if it does not exist).
+2. Under **Deployment protection rules**, enable **Required reviewers** and add yourself.
+
+When a pipeline reaches `terraform-apply`, GitHub pauses and waits for a reviewer to approve before proceeding.
 
 ---
 
@@ -347,7 +364,7 @@ Use this path to deploy directly from your workstation.
 ### 2.1 Clone and configure
 
 ```bash
-git clone https://gitlab.com/<your-group>/online-boutique.git
+git clone https://github.com/<your-org>/online-boutique.git
 cd online-boutique
 ```
 
@@ -356,7 +373,7 @@ Edit the dev tfvars with your values:
 ```bash
 # terraform/environments/dev/terraform.tfvars is already present.
 # Fill in the three placeholder values:
-#   gitlab_project_path
+#   github_repository
 #   tf_state_bucket
 #   tf_lock_table
 ```
@@ -367,9 +384,9 @@ Edit the dev tfvars with your values:
 cd terraform/environments/dev
 
 terraform init \
-  -backend-config="bucket=my-tf-state-online-boutique" \
+  -backend-config="bucket=tf-state-online-boutique-github" \
   -backend-config="region=us-east-1" \
-  -backend-config="dynamodb_table=tf-state-lock"
+  -backend-config="dynamodb_table=tf-state-lock-github"
 ```
 
 ### 2.3 Review the plan
@@ -384,7 +401,7 @@ terraform plan
 terraform apply
 ```
 
-This step creates the VPC, subnets, NAT gateways, EKS cluster, node groups, and GitLab OIDC role. It takes roughly **10–15 minutes**.
+This step creates the VPC, subnets, NAT gateways, EKS cluster, node groups, and GitHub OIDC role. It takes roughly **10–15 minutes**.
 
 When complete, note the outputs:
 
@@ -392,7 +409,7 @@ When complete, note the outputs:
 cluster_name       = "online-boutique-dev"
 cluster_endpoint   = "https://XXXXXXXX.gr7.us-east-1.eks.amazonaws.com"
 kubeconfig_command = "aws eks update-kubeconfig --region us-east-1 --name online-boutique-dev"
-gitlab_ci_role_arn = "arn:aws:iam::123456789012:role/gitlab-ci-oidc-role"
+github_ci_role_arn = "arn:aws:iam::123456789012:role/github-ci-oidc-role"
 ```
 
 ### 2.5 Configure kubectl
@@ -431,18 +448,18 @@ Copy the `EXTERNAL-IP` (an AWS ELB hostname) and open `http://<EXTERNAL-IP>` in 
 
 ---
 
-## Part 3 – GitLab CI/CD pipeline
+## Part 3 – GitHub Actions pipeline
 
-### 3.1 Push the repository to GitLab
+### 3.1 Push the repository to GitHub
 
 ```bash
-git remote add origin https://gitlab.com/<your-group>/<your-project>.git
+git remote add origin https://github.com/<your-org>/<your-repo>.git
 git push -u origin main
 ```
 
-### 3.2 Pipeline stages
+### 3.2 Pipeline jobs
 
-Every push triggers the pipeline automatically.
+Every push that touches `terraform/`, `kubernetes/`, `kustomize/`, or `.github/workflows/deploy.yml` triggers the pipeline automatically. Pull requests also trigger validate and plan.
 
 ```
 validate ──► plan ──► apply* ──► deploy ──► verify
@@ -452,55 +469,56 @@ validate ──► plan ──► apply* ──► deploy ──► verify
 
 `*` = manual trigger required.
 
-| Stage | Job | Runs when | What it does |
-|---|---|---|---|
-| validate | `terraform:fmt` | Every push | Checks Terraform formatting |
-| validate | `terraform:validate` | Every push | Validates Terraform config |
-| validate | `yaml:lint` | Every push | Lints all Kubernetes YAML |
-| plan | `terraform:plan` | Every push | Generates and saves a plan artifact |
-| apply | `terraform:apply` | `main` branch, **manual** | Provisions the EKS cluster |
-| deploy | `app:deploy` | After apply | Deploys all microservices via kustomize |
-| verify | `app:smoke-test` | After deploy | Polls ELB hostname, hits `/_healthz` |
-| destroy | `terraform:destroy` | Any branch, **manual** | Tears down all AWS infrastructure |
+| Job | Runs when | What it does |
+|---|---|---|
+| `terraform:fmt` | Every push | Checks Terraform formatting |
+| `terraform:validate` | Every push | Validates Terraform config |
+| `yaml:lint` | Every push | Lints all Kubernetes YAML |
+| `terraform:plan` | Every push (after validate) | Generates and saves a plan artifact |
+| `terraform:apply` | `main` branch, **manual approval** | Provisions the EKS cluster |
+| `app:deploy` | After apply | Deploys all microservices via kustomize |
+| `dns:apply` | After app:deploy | Applies ACM cert and Route53 DNS |
+| `app:smoke-test` | After dns:apply | Polls ELB hostname, hits `/_healthz` |
+| `terraform:destroy` | **workflow_dispatch** only | Tears down all AWS infrastructure |
 
 ### 3.3 OIDC credential flow in the pipeline
 
-Each AWS-facing job contains this block:
+Each job declares:
 
 ```yaml
-id_tokens:
-  GITLAB_OIDC_TOKEN:
-    aud: "https://gitlab.com"
+permissions:
+  id-token: write
+  contents: read
 ```
 
-GitLab injects a signed JWT into `GITLAB_OIDC_TOKEN`. The `before_script` then exchanges it:
+And authenticates via:
 
-```bash
-CREDS=$(aws sts assume-role-with-web-identity \
-  --role-arn "${CI_AWS_ROLE_ARN}" \
-  --role-session-name "gitlab-$(echo "${CI_JOB_NAME}" | tr ':' '-')-${CI_JOB_ID}" \
-  --web-identity-token "${GITLAB_OIDC_TOKEN}" \
-  --duration-seconds 3600 \
-  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-  --output text)
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_SESSION_TOKEN=...
+```yaml
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+    aws-region: ${{ vars.AWS_DEFAULT_REGION }}
 ```
 
-The credentials are session-scoped, never stored anywhere, and expire when the job ends.
+GitHub injects a signed JWT, and the action exchanges it for temporary AWS credentials automatically. No explicit `aws sts assume-role-with-web-identity` call is needed. The credentials are session-scoped, never stored anywhere, and expire when the job ends.
 
 ### 3.4 Trigger the first pipeline deployment
 
-1. Open your project → **CI/CD → Pipelines**.
-2. The `validate` and `plan` stages run automatically — review the plan in the job log.
-3. Click **play** on `terraform:apply` to provision the EKS cluster.
-4. Once apply completes, `app:deploy` and `app:smoke-test` run automatically.
+1. Open your repository → **Actions**.
+2. The `validate` and `plan` jobs run automatically — review the plan in the job log.
+3. The `terraform:apply` job is paused waiting for approval. Open the run → click **Review deployments** → **Approve**.
+4. Once apply completes, `app:deploy`, `dns:apply`, and `app:smoke-test` run automatically.
 5. Check the `app:smoke-test` log for the frontend URL:
    ```
-   Frontend URL: http://<elb-hostname>
    Health check passed (HTTP 200)
+   App is live at https://online-boutique.cojocloudsolutions.com
    ```
+
+### 3.5 Trigger a destroy
+
+1. Go to **Actions → Online Boutique – Destroy → Run workflow**.
+2. Select the environment (`dev` or `prod`).
+3. Type `destroy` in the confirmation field and click **Run workflow**.
 
 ---
 
@@ -539,8 +557,8 @@ metadata:
 ### Option D – Deploy to prod
 
 1. Edit `terraform/environments/prod/terraform.tfvars` with your values.
-2. Set the GitLab CI variable `TF_VAR_environment` to `prod` and `TF_VAR_cluster_name` to `online-boutique-prod`.
-3. The pipeline uses a separate state key (`online-boutique/prod/terraform.tfstate`) and the OIDC role is restricted to `main`-branch tokens only.
+2. Set the GitHub Actions variable `TF_VAR_environment` to `prod` and `TF_VAR_cluster_name` to `online-boutique-prod`.
+3. The pipeline uses a separate state key (`online-boutique/prod/terraform.tfstate`) and the OIDC role trust policy is restricted to `main`-branch tokens only.
 
 ---
 
@@ -576,7 +594,7 @@ kubectl port-forward svc/frontend 8080:80 -n online-boutique
 # Check Terraform outputs
 cd terraform/environments/dev && terraform output
 
-# Verify OIDC role assumption works (run from a GitLab job or locally with SSO)
+# Verify OIDC role assumption works (run from a GitHub Actions job or locally with SSO)
 aws sts get-caller-identity
 ```
 
@@ -584,9 +602,9 @@ aws sts get-caller-identity
 
 ## Teardown
 
-### Via GitLab CI
+### Via GitHub Actions
 
-Trigger the `terraform:destroy` job manually from the pipeline UI. It destroys **all** AWS resources including the EKS cluster, VPC, and ElastiCache (if enabled).
+Go to **Actions → Online Boutique – Destroy → Run workflow**, select the environment, type `destroy` to confirm. This tears down **all** AWS resources including the EKS cluster, VPC, and ElastiCache (if enabled).
 
 ### Manually
 
@@ -597,7 +615,7 @@ terraform destroy
 
 > **Note:** The S3 bucket and DynamoDB table created in Part 1 are not managed by Terraform and must be deleted manually if no longer needed.
 
-> **Important:** Running `terraform destroy` also removes the GitLab OIDC provider and IAM role. After a full destroy, the pipeline cannot authenticate until the OIDC module is re-bootstrapped locally: `terraform apply -target=module.gitlab_oidc`. To avoid this, run `terraform destroy` with `-target` on everything *except* the OIDC module, or just use the pipeline's `terraform:destroy` job which preserves the OIDC resources in state.
+> **Important:** Running `terraform destroy` also removes the GitHub OIDC provider and IAM role. After a full destroy, the pipeline cannot authenticate until the OIDC module is re-bootstrapped locally: `terraform apply -target=module.github_oidc`. To avoid this, run `terraform destroy` with `-target` on everything *except* the OIDC module, or just use the destroy workflow which preserves the OIDC resources in state.
 
 ---
 
@@ -605,8 +623,8 @@ terraform destroy
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `terraform init` fails with S3 error | Bucket does not exist or wrong region | Check bucket name and region in `-backend-config` flags |
-| `UnauthorizedAccess` during `assume-role-with-web-identity` | OIDC trust policy `sub` condition does not match the pipeline's project path or branch | Check `gitlab_project_path` in the `gitlab-oidc` module and the branch pattern |
+| `terraform init` fails with S3 error | Bucket does not exist or wrong region | Check bucket name and region in the Actions variables |
+| `UnauthorizedAccess` during OIDC | OIDC trust policy `sub` condition does not match the repository path or branch | Check `github_repository` in the `github-oidc` module and the branch pattern |
 | `ERR_EMPTY_RESPONSE` / LoadBalancer exists but no pods | Namespace PSS `restricted` rejected all pods at admission (0 pods, no events) | Namespace enforce level is set to `baseline` in Terraform; if manually overridden run `kubectl label namespace online-boutique pod-security.kubernetes.io/enforce=baseline --overwrite` then `kubectl rollout restart deployment -n online-boutique` |
 | Nodes stuck in `NotReady` | VPC-CNI addon not healthy | `kubectl describe nodes` → check events; verify prefix delegation settings |
 | Pods in `Pending` (no reason) | Insufficient node capacity | Increase `node_max_size` or use a larger instance type |
@@ -615,4 +633,5 @@ terraform destroy
 | HPA shows `<unknown>/60%` for CPU or services stuck at 0 replicas | Metrics Server not installed — EKS does **not** include it by default | `kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml` (already included in the `app:deploy` pipeline job) |
 | NetworkPolicy blocking unexpected traffic | Default-deny is too strict | `kubectl describe networkpolicy <name> -n online-boutique`; add a policy for the missing path |
 | `aws eks update-kubeconfig` fails | Cluster endpoint is private (prod) | Must run from within the VPC (bastion host or VPN) in prod |
-
+| `terraform:apply` job never starts | Environment protection rules not configured | Go to Settings → Environments → `dev` → add Required reviewers |
+| `id-token: write` permission error | Workflow `permissions` block missing | Ensure `permissions: id-token: write` is set at workflow or job level in the workflow file |

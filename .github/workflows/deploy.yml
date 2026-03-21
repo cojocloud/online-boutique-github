@@ -1,0 +1,426 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Online Boutique – GitHub Actions CI/CD Pipeline
+#
+# Authentication: GitHub Actions OIDC → AWS STS (no long-lived credentials)
+# ─────────────────────────────────────────────────────────────────────────────
+# First-time bootstrap (one-off, done locally):
+#   cd terraform/environments/dev
+#   terraform init -backend-config="bucket=..." -backend-config="..."
+#   terraform apply -target=module.github_oidc
+#   terraform output github_ci_role_arn           # copy this value
+#
+# GitHub Actions Variables (Settings → Secrets and variables → Actions → Variables):
+#   GH_AWS_ROLE_ARN     – ARN output by the OIDC bootstrap
+#                         (e.g. arn:aws:iam::123456789012:role/github-ci-oidc-role)
+#   AWS_DEFAULT_REGION  – e.g. us-east-1
+#   TF_STATE_BUCKET     – S3 bucket for Terraform remote state
+#   TF_LOCK_TABLE       – DynamoDB table for state locking
+#   TF_VAR_cluster_name – (optional) override cluster name
+#   TF_VAR_environment  – (optional) dev | staging | prod  (default: dev)
+#
+# NO AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY are needed — credentials are
+# minted per-job via aws-actions/configure-aws-credentials (OIDC) and expire
+# when the job ends.
+#
+# Pipeline jobs:
+#   validate → lint & format checks
+#   plan     → terraform plan (every push)
+#   apply    → terraform apply (main branch, manual gate via environment)
+#   deploy   → kubectl apply  (after apply)
+#   verify   → smoke-test the deployed app
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Online Boutique – CI/CD
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".github/workflows/deploy.yml"
+      - "terraform/**"
+      - "kubernetes/**"
+      - "kustomize/**"
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "kubernetes/**"
+      - "kustomize/**"
+  workflow_dispatch:
+
+# Required for GitHub OIDC token minting
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VAR_environment: ${{ vars.TF_VAR_environment || 'dev' }}
+  TF_VAR_cluster_name: ${{ vars.TF_VAR_cluster_name || 'online-boutique' }}
+  TF_IN_AUTOMATION: "true"
+
+# ── Stage: validate ────────────────────────────────────────────────────────────
+
+jobs:
+  terraform-fmt:
+    name: terraform:fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform fmt check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+  terraform-validate:
+    name: terraform:validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform validate
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: terraform validate
+
+  yaml-lint:
+    name: yaml:lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet yamllint
+
+      - run: |
+          yamllint -d relaxed kubernetes/
+          yamllint -d relaxed kustomize/
+
+# ── Stage: plan ────────────────────────────────────────────────────────────────
+
+  terraform-plan:
+    name: terraform:plan
+    runs-on: ubuntu-latest
+    needs: [terraform-fmt, terraform-validate, yaml-lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -var="aws_region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -var="enable_route53=false"
+          # enable_route53=false keeps module.route53 out of this plan.
+          # module.route53 reads data.kubernetes_ingress_v1.frontend which does
+          # not exist yet on a fresh deploy (app:deploy hasn't run). dns-apply
+          # manages Route53 exclusively via a targeted apply after app:deploy.
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            terraform/environments/${{ env.TF_VAR_environment }}/tfplan
+            terraform/environments/${{ env.TF_VAR_environment }}/.terraform.lock.hcl
+          retention-days: 7
+
+# ── Stage: apply ────────────────────────────────────────────────────────────────
+# The `environment` key triggers the manual approval gate.
+# Configure required reviewers in: Settings → Environments → <env-name> → Protection rules
+
+  terraform-apply:
+    name: terraform:apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main'
+    environment: ${{ vars.TF_VAR_environment || 'dev' }}
+    outputs:
+      eks_cluster_name: ${{ steps.tf-outputs.outputs.cluster_name }}
+      eks_region: ${{ steps.tf-outputs.outputs.cluster_region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false   # required for `terraform output` to work cleanly
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: terraform/environments/${{ env.TF_VAR_environment }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform apply
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform outputs
+        id: tf-outputs
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "cluster_region=$(terraform output -raw cluster_region)" >> "$GITHUB_OUTPUT"
+
+# ── Stage: deploy ────────────────────────────────────────────────────────────────
+
+  app-deploy:
+    name: app:deploy
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    if: github.ref == 'refs/heads/main'
+    env:
+      EKS_CLUSTER_NAME: ${{ needs.terraform-apply.outputs.eks_cluster_name }}
+      EKS_REGION: ${{ needs.terraform-apply.outputs.eks_region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$EKS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Install kustomize
+        run: |
+          curl -sLO "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+          tar xzf kustomize_v5.4.3_linux_amd64.tar.gz -C /tmp/
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Create namespace
+        run: kubectl create namespace online-boutique --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Install metrics-server
+        # Required by HPA; not bundled with EKS by default
+        run: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+      - name: Wait for ALB IngressClass
+        # LBC is installed by terraform:apply via Helm; it needs ~30-60s to start
+        run: |
+          for i in $(seq 1 12); do
+            kubectl get ingressclass alb >/dev/null 2>&1 && break
+            echo "Waiting for alb IngressClass... (${i}/12)"
+            sleep 15
+          done
+          kubectl get ingressclass alb >/dev/null 2>&1 \
+            || echo "WARNING: alb IngressClass not yet registered — LBC pods may still be starting"
+
+      - name: Deploy application
+        run: |
+          kustomize build --load-restrictor=LoadRestrictionsNone kustomize/ | kubectl apply -n online-boutique -f -
+          kubectl rollout status deployment --timeout=300s -n online-boutique
+
+  dns-apply:
+    name: dns:apply
+    runs-on: ubuntu-latest
+    needs: app-deploy
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            --name "${{ vars.TF_VAR_cluster_name || 'online-boutique' }}"
+
+      - name: Apply ACM certificate
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -target=module.acm[0] \
+            -var="aws_region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}"
+
+      - name: Annotate Ingress with ACM cert
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          CERT_ARN=$(terraform output -raw acm_certificate_arn)
+          kubectl annotate ingress frontend -n online-boutique \
+            "alb.ingress.kubernetes.io/certificate-arn=${CERT_ARN}" \
+            "alb.ingress.kubernetes.io/ssl-redirect=443" \
+            'alb.ingress.kubernetes.io/listen-ports=[{"HTTP": 80}, {"HTTPS": 443}]' \
+            --overwrite
+
+      - name: Wait for ALB hostname
+        run: |
+          for i in $(seq 1 30); do
+            ALB_HOST=$(kubectl get ingress frontend -n online-boutique \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "${ALB_HOST}" ] && break
+            echo "Waiting for ALB hostname... (${i}/30)"
+            sleep 15
+          done
+          if [ -z "${ALB_HOST}" ]; then
+            echo "ERROR: ALB hostname not available after timeout"
+            exit 1
+          fi
+          echo "ALB hostname: ${ALB_HOST}"
+
+      - name: Apply Route53 DNS
+        working-directory: terraform/environments/${{ env.TF_VAR_environment }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -target=module.route53[0] \
+            -var="aws_region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}"
+          echo "Frontend URL $(terraform output -raw frontend_url)"
+
+# ── Stage: verify ────────────────────────────────────────────────────────────────
+
+  app-smoke-test:
+    name: app:smoke-test
+    runs-on: ubuntu-latest
+    needs: dns-apply
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            --name "${{ vars.TF_VAR_cluster_name || 'online-boutique' }}"
+
+      - name: Wait for ALB hostname
+        run: |
+          for i in $(seq 1 20); do
+            ALB_HOST=$(kubectl get ingress frontend -n online-boutique \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "${ALB_HOST}" ] && break
+            echo "Waiting for ALB hostname... (${i}/20)"
+            sleep 15
+          done
+          if [ -z "${ALB_HOST}" ]; then
+            echo "ERROR: ALB hostname not available after timeout"
+            exit 1
+          fi
+          echo "ALB_HOST=${ALB_HOST}" >> "$GITHUB_ENV"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 10); do
+            # Follow redirects (-L) and skip cert check (-k) since the cert is issued
+            # for the custom domain, not the raw ALB hostname
+            STATUS=$(curl -skL -o /dev/null -w "%{http_code}" "http://${ALB_HOST}/_healthz" || true)
+            if [ "${STATUS}" = "200" ]; then
+              echo "Health check passed (HTTP ${STATUS})"
+              echo "App is live at https://online-boutique.cojocloudsolutions.com"
+              exit 0
+            fi
+            echo "Health check returned ${STATUS}, retrying (${i}/10)..."
+            sleep 30
+          done
+          echo "ERROR: Health check failed after retries"
+          exit 1

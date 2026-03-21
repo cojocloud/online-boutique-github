@@ -420,3 +420,19 @@ Terraform provider resource/data source implementations often make additional AP
 | 17 | `AccessDenied: kms:TagResource` and `logs:ListTagsForResource` during apply | IAM policy covered plan-time reads but not apply-time writes needed by EKS community module | Expand KMS + CloudWatch Logs statements to cover full resource lifecycle; apply `-target=module.gitlab_oidc` |
 | 18 | `ResourceAlreadyExistsException` on CloudWatch log group | Partial apply left resource tainted; next apply tried destroy-recreate but hit existing resource | `terraform untaint` the resource; fresh pipeline saw it as healthy and skipped creation |
 | 19 | `route53:ListTagsForResource` denied on `data` source lookup | AWS provider calls `ListTagsForResource` internally when reading a hosted zone, even read-only | Add `route53:ListTagsForResource` to Route53DNS IAM statement; apply `-target=module.gitlab_oidc` |
+
+
+
+
+```
+aws s3api create-bucket --bucket tf-state-online-boutique-github --region us-east-1
+aws s3api put-bucket-versioning --bucket tf-state-online-boutique-github --versioning-configuration Status=Enabled
+aws dynamodb create-table --table-name tf-state-lock-github \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST --region us-east-1
+```
+
+```
+cp terraform/environments/dev/terraform.tfvars.example terraform/environments/dev/terraform.tfvars
+```

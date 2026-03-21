@@ -93,11 +93,11 @@ variable "elasticache_high_availability" {
   default = false
 }
 
-# ── GitLab OIDC ───────────────────────────────────────────────────────────────
+# ── GitHub OIDC ───────────────────────────────────────────────────────────────
 
-variable "gitlab_project_path" {
+variable "github_repository" {
   type        = string
-  description = "GitLab project path (e.g. my-group/online-boutique)"
+  description = "GitHub repository in the form 'org/repo' (e.g. my-org/online-boutique)"
 }
 
 variable "tf_state_bucket" {
