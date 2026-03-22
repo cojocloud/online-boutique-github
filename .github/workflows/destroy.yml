@@ -1,0 +1,61 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Online Boutique – Terraform Destroy (manual)
+#
+# Triggered manually from Actions → Destroy workflow.
+# Equivalent to the `terraform:destroy` stage in the former GitLab pipeline.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Online Boutique – Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm:
+        description: 'Type "destroy" to confirm teardown'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform-destroy:
+    name: terraform:destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'destroy'
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GH_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform destroy
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform destroy \
+            -auto-approve \
+            -var="aws_region=${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}"

@@ -3,9 +3,9 @@ variable "aws_region" {
   default = "us-east-1"
 }
 
-variable "gitlab_project_path" {
+variable "github_repository" {
   type        = string
-  description = "GitLab project path (e.g. newthiesco/online-boutique)"
+  description = "GitHub repository in the form 'org/repo' (e.g. my-org/online-boutique)"
 }
 
 variable "tf_state_bucket" {

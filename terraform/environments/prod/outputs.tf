@@ -34,9 +34,9 @@ output "kubeconfig_command" {
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
 }
 
-output "gitlab_ci_role_arn" {
-  description = "Set this value as CI_AWS_ROLE_ARN in GitLab CI/CD Variables to enable OIDC auth"
-  value       = module.gitlab_oidc.role_arn
+output "github_ci_role_arn" {
+  description = "Set this as GH_AWS_ROLE_ARN in GitHub Actions Variables to enable OIDC auth"
+  value       = module.github_oidc.role_arn
 }
 
 output "elasticache_endpoint" {

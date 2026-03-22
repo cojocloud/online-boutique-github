@@ -34,6 +34,11 @@ output "kubeconfig_command" {
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
 }
 
+output "github_ci_role_arn" {
+  description = "Set this as GH_AWS_ROLE_ARN in GitHub Actions Variables to enable OIDC auth"
+  value       = module.github_oidc.role_arn
+}
+
 output "elasticache_endpoint" {
   description = "ElastiCache Redis primary endpoint (null when disabled)"
   value       = var.enable_elasticache ? module.elasticache[0].primary_endpoint : null

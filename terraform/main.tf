@@ -51,13 +51,13 @@ module "elasticache" {
   node_type              = var.elasticache_node_type
 }
 
-# Bootstrap GitLab OIDC trust. After the first apply, copy the role_arn output
-# and set it as CI_AWS_ROLE_ARN in GitLab → Settings → CI/CD → Variables.
-module "gitlab_oidc" {
-  source = "./modules/gitlab-oidc"
+# Bootstrap GitHub OIDC trust. After the first apply, copy the role_arn output
+# and set it as GH_AWS_ROLE_ARN in GitHub → Settings → Secrets and variables → Actions → Variables.
+module "github_oidc" {
+  source = "./modules/github-oidc"
 
-  gitlab_project_path = var.gitlab_project_path
-  allowed_branches    = var.environment == "prod" ? "main" : "*"
+  github_repository   = var.github_repository
+  allowed_ref_pattern = var.environment == "prod" ? "ref:refs/heads/main" : "*"
   tf_state_bucket     = var.tf_state_bucket
   tf_lock_table       = var.tf_lock_table
 }

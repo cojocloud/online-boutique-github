@@ -21,7 +21,7 @@ terraform {
   }
 
   # S3 backend with partial configuration — remaining values supplied at
-  # terraform init via -backend-config flags (see .gitlab-ci.yml).
+  # terraform init via -backend-config flags (see .github/workflows/deploy.yml).
   backend "s3" {
     key     = "online-boutique/dev/terraform.tfstate"
     encrypt = true

@@ -94,11 +94,11 @@ variable "elasticache_node_type" {
   default     = "cache.t3.micro"
 }
 
-# ── GitLab OIDC ───────────────────────────────────────────────────────────────
+# ── GitHub OIDC ───────────────────────────────────────────────────────────────
 
-variable "gitlab_project_path" {
+variable "github_repository" {
   type        = string
-  description = "GitLab project path (e.g. my-group/online-boutique) — used to scope the OIDC trust policy"
+  description = "GitHub repository in the form 'org/repo' (e.g. my-org/online-boutique) — used to scope the OIDC trust policy"
 }
 
 variable "tf_state_bucket" {

@@ -1,0 +1,11 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to version control (it is already in .gitignore).
+
+github_repository = "your-github-org/online-boutique"
+tf_state_bucket   = "tf-state-online-boutique-github"
+tf_lock_table     = "tf-state-lock-github"
+
+# Optional overrides — defaults are already set in variables.tf
+# aws_region          = "us-east-1"
+# cluster_name        = "online-boutique-dev"
+# enable_elasticache  = false
