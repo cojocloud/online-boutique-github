@@ -54,25 +54,25 @@ variable "node_instance_types" {
 }
 
 variable "node_desired_size" {
-  type    = number
+  type = number
   # POC default: 2  |  Production recommendation: 3
   default = 2
 }
 
 variable "node_min_size" {
-  type    = number
+  type = number
   # POC default: 1  |  Production recommendation: 3
   default = 1
 }
 
 variable "node_max_size" {
-  type    = number
+  type = number
   # POC default: 4  |  Production recommendation: 10
   default = 4
 }
 
 variable "node_disk_size" {
-  type    = number
+  type = number
   # POC default: 50  |  Production recommendation: 100
   default = 50
 }
