@@ -55,6 +55,9 @@ permissions:
 env:
   TF_VAR_environment: ${{ vars.TF_VAR_environment || 'dev' }}
   TF_VAR_cluster_name: ${{ vars.TF_VAR_cluster_name || 'online-boutique' }}
+  TF_VAR_github_repository: ${{ github.repository }}
+  TF_VAR_tf_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+  TF_VAR_tf_lock_table: ${{ vars.TF_LOCK_TABLE }}
   TF_IN_AUTOMATION: "true"
 
 # ── Stage: validate ────────────────────────────────────────────────────────────
